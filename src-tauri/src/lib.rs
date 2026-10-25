@@ -3,7 +3,7 @@
 // ============================================================
 // 本文件是 Tauri 应用的核心后端代码，负责：
 // 1. 注册可被前端（React）调用的 Rust 命令
-// 2. 处理工程文件（.zip 内包含 .toml 配置）的读写
+// 2. 处理工程文件（.zip 内包含 .toml 配置 + 音频文件）的读写
 // 3. 管理 Tauri 插件的初始化
 //
 // 快速理解：
@@ -12,9 +12,10 @@
 // - plugin() 用于注册 Tauri 官方插件（如文件对话框、系统浏览器等）
 // ============================================================
 
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use serde::{Deserialize, Serialize};
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
@@ -23,29 +24,52 @@ use zip::ZipWriter;
 // -----------------------------------------------------------
 
 /// 工程配置文件在 zip 包内的文件名
-/// 存储格式为 TOML（比 JSON 更适合人工编辑配置文件）
 const PROJECT_FILE: &str = "project.toml";
+/// 音频文件在 zip 包内的条目名（无扩展名）
+const AUDIO_ENTRY: &str = "audio";
 
 /// 一个完整的工程数据结构
-/// #[derive(Serialize, Deserialize)] 是 Rust 的"魔法"——
-/// 自动为这个结构体生成与 TOML/JSON 等格式互转的代码
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Project {
-    /// 工程文件格式版本号，用于未来兼容不同版本
+    /// 工程文件格式版本号
     version: String,
+    /// 乐曲名称
+    song_title: String,
     /// 曲目 BPM（Beats Per Minute，每分钟节拍数）
     bpm: f64,
-    /// 音符列表，目前为空，后续将填充音符数据
+    /// 节拍（如 "4/4"、"3/4"、"6/8"）
+    time_signature: String,
+    /// 音频文件扩展名（如 "mp3"、"wav"），不含点号
+    audio_ext: String,
+    /// 音频源文件名（如 "song.mp3"）
+    audio_name: String,
+    /// 音符列表
     notes: Vec<Note>,
 }
 
 /// 单个音符的数据结构
-/// 目前是最简定义，后续会根据音游类型扩展字段
-/// （如：下落式音游需要 lane、time、type 等）
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Note {
-    /// 占位字段，后续替换为实际音符属性
     placeholder: String,
+}
+
+/// open_project 命令的返回值
+/// 包含 TOML 配置内容和可选的音频 base64 数据
+#[derive(Serialize)]
+struct OpenProjectResult {
+    toml: String,
+    /// 音频文件的 base64 编码，如果工程中没有音频则为 None
+    audio_base64: Option<String>,
+}
+
+// -----------------------------------------------------------
+// 辅助函数
+// -----------------------------------------------------------
+
+/// 将任意文件读取为 base64 字符串
+fn file_to_base64(path: &str) -> Result<String, String> {
+    let data = fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
 
 // -----------------------------------------------------------
@@ -53,111 +77,114 @@ struct Note {
 // -----------------------------------------------------------
 
 /// 新建工程
-///
-/// 前端调用方式：
-///   const data = await invoke("new_project");
-///
-/// 行为：
-///   创建一个空的工程数据，序列化为 TOML 字符串返回给前端。
-///   前端可以将此字符串保存到 .zip 文件中。
 #[tauri::command]
 fn new_project() -> Result<String, String> {
-    // 构造一个默认的空工程
     let project = Project {
         version: "0.1.0".to_string(),
+        song_title: String::new(),
         bpm: 120.0,
-        notes: vec![], // 空音符列表
+        time_signature: "4/4".to_string(),
+        audio_ext: String::new(),
+        audio_name: String::new(),
+        notes: vec![],
     };
-    // 将 Rust 结构体序列化为格式化的 TOML 字符串
-    // to_string_pretty 会生成带缩进、易读的输出
     toml::to_string_pretty(&project).map_err(|e| format!("TOML 序列化失败: {}", e))
 }
 
 /// 打开工程文件
 ///
-/// 前端调用方式：
-///   const data = await invoke("open_project", { path: "/path/to/file.zip" });
-///
-/// 行为：
-///   1. 通过文件路径打开 .zip 压缩包
-///   2. 在压缩包内查找 project.toml 文件
-///   3. 读取其内容，返回给前端
+/// 返回 { toml: "...", audio_base64: "..." | null }
+/// 如果 zip 内包含 audio 文件，则将其以 base64 编码一并返回
 #[tauri::command]
-fn open_project(path: &str) -> Result<String, String> {
-    // 步骤1：以只读方式打开文件
+fn open_project(path: &str) -> Result<OpenProjectResult, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
-
-    // 步骤2：以 zip 格式解析文件内容
-    // ZipArchive 允许我们像操作文件夹一样操作 zip 包
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("无法读取 zip: {}", e))?;
 
-    // 步骤3：在 zip 中按文件名查找 project.toml
-    let mut entry = archive
-        .by_name(PROJECT_FILE)
-        .map_err(|e| format!("zip 中未找到 {}: {}", PROJECT_FILE, e))?;
+    // 读取 project.toml（独立作用域，确保 entry 在音频读取前释放）
+    let contents = {
+        let mut entry = archive
+            .by_name(PROJECT_FILE)
+            .map_err(|_| format!("无效的工程文件：zip 中未找到 {}", PROJECT_FILE))?;
+        let mut s = String::new();
+        entry
+            .read_to_string(&mut s)
+            .map_err(|e| format!("读取 project.toml 失败: {}", e))?;
+        s
+    }; // entry 在此处被 drop，archive 的借用释放
 
-    // 步骤4：将文件内容读取到字符串中
-    let mut contents = String::new();
-    entry
-        .read_to_string(&mut contents)
-        .map_err(|e| format!("读取失败: {}", e))?;
+    // 尝试读取音频文件
+    let audio_base64 = match archive.by_name(AUDIO_ENTRY) {
+        Ok(mut audio_entry) => {
+            let mut audio_data = Vec::new();
+            audio_entry
+                .read_to_end(&mut audio_data)
+                .map_err(|e| format!("读取音频数据失败: {}", e))?;
+            Some(base64::engine::general_purpose::STANDARD.encode(&audio_data))
+        }
+        Err(_) => None,
+    };
 
-    Ok(contents)
+    Ok(OpenProjectResult {
+        toml: contents,
+        audio_base64,
+    })
 }
 
 /// 保存工程文件
 ///
-/// 前端调用方式：
-///   await invoke("save_project", { path: "/path/to/file.zip", data: tomlString });
-///
-/// 行为：
-///   1. 创建一个新的 .zip 文件（如果已存在则覆盖）
-///   2. 将传入的 TOML 字符串作为 project.toml 写入压缩包
-///   3. 使用 Deflated 压缩算法（平衡压缩率与速度）
+/// 将 TOML 配置和可选的音频文件写入 zip 包
+/// audio_path 为音频文件的磁盘路径，传入时 Rust 会读取该文件并存入 zip
 #[tauri::command]
-fn save_project(path: &str, data: &str) -> Result<(), String> {
-    // 步骤1：创建目标文件
+fn save_project(path: &str, data: &str, audio_path: Option<&str>) -> Result<(), String> {
     let file = fs::File::create(path).map_err(|e| format!("无法创建文件: {}", e))?;
-
-    // 步骤2：创建 zip 写入器——ZipWriter 负责将数据写入 zip 格式
     let mut zip = ZipWriter::new(file);
+    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
 
-    // 步骤3：配置压缩选项
-    // FileOptions 指定了 zip 条目的元数据和压缩方式
-    // <()> 表示不附加额外扩展属性（如 Unix 文件权限等）
-    // Deflated 是 zip 最常用的压缩算法，兼容性好
-    let options = FileOptions::<()>::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-
-    // 步骤4：在 zip 中创建一个新文件条目，名为 project.toml
+    // 写入 project.toml
     zip.start_file(PROJECT_FILE, options)
         .map_err(|e| format!("写入 zip 失败: {}", e))?;
-
-    // 步骤5：将 TOML 数据写入该条目
     zip.write_all(data.as_bytes())
         .map_err(|e| format!("写入数据失败: {}", e))?;
 
-    // 步骤6：完成 zip 写入（必须调用 finish，否则 zip 文件不完整）
-    zip.finish().map_err(|e| format!("完成 zip 失败: {}", e))?;
+    // 如果提供了音频路径，将音频文件读入 zip（条目名固定为 "audio"）
+    if let Some(audio) = audio_path {
+        if !audio.is_empty() {
+            let audio_data =
+                fs::read(audio).map_err(|e| format!("读取音频文件失败: {}", e))?;
+            zip.start_file(AUDIO_ENTRY, options)
+                .map_err(|e| format!("写入音频到 zip 失败: {}", e))?;
+            zip.write_all(&audio_data)
+                .map_err(|e| format!("写入音频数据失败: {}", e))?;
+        }
+    }
 
+    zip.finish().map_err(|e| format!("完成 zip 失败: {}", e))?;
     Ok(())
+}
+
+/// 读取任意音频文件并返回 base64 编码
+///
+/// 用于用户在谱面编辑器中选择了音乐文件后，前端获取可播放的音频数据
+#[tauri::command]
+fn read_audio_file(path: &str) -> Result<String, String> {
+    file_to_base64(path)
 }
 
 // -----------------------------------------------------------
 // Tauri 应用入口
 // -----------------------------------------------------------
 
-/// 桌面端入口函数
-/// 移动端有单独的入口，通过下面的 cfg_attr 宏条件编译
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // 注册 opener 插件：用于在系统默认浏览器中打开链接
         .plugin(tauri_plugin_opener::init())
-        // 注册 dialog 插件：用于调用系统原生的文件选择/保存对话框
         .plugin(tauri_plugin_dialog::init())
-        // 注册所有 #[tauri::command] 标记的函数，使其可被前端 invoke 调用
-        .invoke_handler(tauri::generate_handler![new_project, open_project, save_project])
+        .invoke_handler(tauri::generate_handler![
+            new_project,
+            open_project,
+            save_project,
+            read_audio_file
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
