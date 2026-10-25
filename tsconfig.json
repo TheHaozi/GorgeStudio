@@ -6,7 +6,7 @@
     "module": "ESNext",
     "skipLibCheck": true,
 
-    /* Bundler mode */
+    /* 打包器（Bundler）模式 */
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
@@ -14,7 +14,7 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
-    /* Linting */
+    /* 类型检查与静态校验 */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

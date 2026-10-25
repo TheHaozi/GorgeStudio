@@ -1,18 +1,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// @ts-expect-error process is a nodejs global
+// @ts-expect-error process 是 Node.js 的全局变量，此处无类型声明
 const host = process.env.TAURI_DEV_HOST;
 
-// https://vite.dev/config/
+// Vite 配置参考：https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
+  // 以下 Vite 选项专为 Tauri 开发与构建（tauri dev / tauri build）定制。
+
+  // 1. 关闭清屏，避免 Vite 清屏掩盖 Rust 侧的编译错误。
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  // 2. Tauri 要求使用固定端口，端口被占用时直接失败。
   server: {
     port: 1420,
     strictPort: true,
@@ -25,7 +25,7 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
+      // 3. 忽略监听 src-tauri 目录，避免 Rust 源码变更触发前端热更新。
       ignored: ["**/src-tauri/**"],
     },
   },
